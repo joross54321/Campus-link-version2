@@ -1,0 +1,153 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // 0. Global Safety Net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // --- Helpers ---
+    
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function getUserData(uid) {
+      return get(/databases/$(database)/documents/users/$(uid)).data;
+    }
+
+    function isRole(role) {
+      return isSignedIn() && getUserData(request.auth.uid).role == role;
+    }
+
+    function isRegistrar() {
+      return isRole('registrar');
+    }
+
+    function isProfessor() {
+      return isRole('professor');
+    }
+
+    function isStudent() {
+      return isRole('student');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    // --- Validation Helpers ---
+
+    function isValidUser(data) {
+      return data.studentId is string && data.studentId.size() <= 64 &&
+             data.surname is string && data.surname.size() <= 100 &&
+             data.role in ['student', 'professor', 'registrar'] &&
+             (!('firstName' in data) || (data.firstName is string && data.firstName.size() <= 100)) &&
+             (!('maxUnits' in data) || (data.maxUnits is number)) &&
+             (!('address' in data) || (data.address is string && data.address.size() <= 500)) &&
+             (!('contact' in data) || (data.contact is string && data.contact.size() <= 100));
+    }
+
+    function isValidSubject(data) {
+      return data.code is string && data.code.size() <= 20 &&
+             data.title is string && data.title.size() <= 200 &&
+             data.units is number && data.units >= 1 && data.units <= 10 &&
+             data.semester in ['1', '2', 'Summer'] &&
+             data.status in ['open', 'full'] &&
+             (!('prerequisites' in data) || (data.prerequisites is list)) &&
+             (!('yearLevel' in data) || (data.yearLevel is number)) &&
+             (!('college' in data) || (data.college is string));
+    }
+
+    function isValidEnrollment(data) {
+      return data.userId is string && data.subjectId is string &&
+             data.academicYear is string && data.semester is string &&
+             data.status in ['pending', 'approved', 'dropped'];
+    }
+
+    function isValidGrade(data) {
+      return data.userId is string && data.subjectId is string &&
+             data.professorId is string && data.grade is number &&
+             data.status in ['pending', 'posted'];
+    }
+
+    // --- Rules ---
+
+    match /users/{userId} {
+      allow get: if isOwner(userId) || isRegistrar() || isProfessor();
+      allow list: if isRegistrar();
+      
+      allow create: if (isRegistrar() || (isSignedIn() && !exists(/databases/$(database)/documents/system/config))) && isValidUser(incoming());
+      
+      allow update: if (
+        (isRegistrar() && isValidUser(incoming())) ||
+        (isOwner(userId) && incoming().diff(existing()).affectedKeys().hasOnly(['address', 'contact', 'surname']) && isValidUser(incoming()))
+      );
+    }
+
+    match /subjects/{subjectId} {
+      allow read: if isSignedIn();
+      allow write: if (isRegistrar() || (isSignedIn() && !exists(/databases/$(database)/documents/system/config))) && isValidSubject(incoming());
+    }
+
+    match /enrollments/{enrollmentId} {
+      allow read: if isOwner(incoming().userId) || isRegistrar() || (isProfessor() && isProfessorManaged(resource.data.subjectId));
+      allow list: if isSignedIn() && (resource.data.userId == request.auth.uid || isRegistrar());
+      
+      allow create: if isStudent() && isOwner(incoming().userId) && isValidEnrollment(incoming()) &&
+                    incoming().status == 'pending' &&
+                    get(/databases/$(database)/documents/subjects/$(incoming().subjectId)).data.status == 'open';
+      
+      allow update: if (
+        (isRegistrar() && isValidEnrollment(incoming())) ||
+        (isOwner(existing().userId) && isStudent() && 
+         incoming().diff(existing()).affectedKeys().hasOnly(['status']) && 
+         incoming().status == 'dropped' &&
+         isBeforeMidtermLock())
+      );
+    }
+
+    match /grades/{gradeId} {
+      allow read: if (isStudent() && isOwner(resource.data.userId) && resource.data.status == 'posted') ||
+                     isProfessor() || isRegistrar();
+      
+      allow create: if isProfessor() && isValidGrade(incoming()) && incoming().status == 'pending';
+      
+      allow update: if (
+        (isProfessor() && isValidGrade(incoming()) && existing().status == 'pending') ||
+        (isRegistrar() && incoming().diff(existing()).affectedKeys().hasOnly(['status']) && incoming().status == 'posted')
+      );
+    }
+
+    match /system/config {
+      allow read: if isSignedIn();
+      allow write: if isRegistrar() || (isSignedIn() && !exists(/databases/$(database)/documents/system/config));
+    }
+
+    // --- Business Logic Helpers ---
+    
+    function isBeforeMidtermLock() {
+      let config = get(/databases/$(database)/documents/system/config).data;
+      return request.time < duration.value(config.midtermDate);
+    }
+
+    function isProfessorManaged(subjectId) {
+      // Logic to check if professor handles this subject section (simplified for now)
+      return true; 
+    }
+  }
+}
